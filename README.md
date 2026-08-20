@@ -1,6 +1,13 @@
+<img src="https://i.postimg.cc/Xqgn5vhV/samoyed-i-OS-Default-1024x1024-1x.png" width="150">
+
 # Bitarf RI
 
 Bitarf RI 是一個以繁體中文 iOS 長紙捲版面編輯器 app 的重建資料庫。它保留文件管理、畫布編輯、文字排版、向量與圖片匯入、遞色、預覽及基礎 Bluetooth 介面的程式，並以一個「經典機型」為範例提供印表機硬體完整實作的 coding agent 用重建提示詞。
+
+## Disclaimer
+This is a product of cognitive automation. Interact with codes, prompts, and built artifacts inside with care. 
+
+![](https://i.postimg.cc/jqBH3SD0/STIIITCH-2026-08-20-07-43-05.png)
 
 ## 專案內容
 
@@ -47,10 +54,11 @@ Bitarf RI 是一個以繁體中文 iOS 長紙捲版面編輯器 app 的重建資
 ## 致謝
 
 Bitarf RI 的自動化程式在編寫時，從以下專案獲得啟發：
-- tinyprinter/python-paperang
-https://github.com/tinyprinter/python-paperang
-- Yrr0r/paperang-web
-https://github.com/Yrr0r/paperang-web
+- [tinyprinter/python-paperang](https://github.com/tinyprinter/python-paperang)
+- [Yrr0r/paperang-web](https://github.com/Yrr0r/paperang-web)
 
 ##  授權
 不得將 Bitarf RI 品牌改為 Bitarf。除此之外，Fork 專案後你愛幹嘛幹嘛。
+
+
+##### 2026 Instructed by PY Cognitive Automations in Taiwan
