@@ -2,12 +2,14 @@
 
 # Bitarf RI
 
-Bitarf RI 是一個以繁體中文 iOS 長紙捲版面編輯器 app 的重建資料庫。它保留文件管理、畫布編輯、文字排版、向量與圖片匯入、遞色、預覽及基礎 Bluetooth 介面的程式，並以一個「經典機型」為範例提供印表機硬體完整實作的 coding agent 用重建提示詞。
+Bitarf RI 是一個以繁體中文 iOS 長紙捲版面編輯器 app 的重建資料庫。它保留文件管理、畫布編輯、文字排版、向量與圖片匯入、遞色、預覽及基礎 Bluetooth 介面的程式，並以一個「經典機型」為範例提供 384 點陣連續紙印表機硬體完整實作的 coding agent 用重建提示詞。
 
 ## Disclaimer
 This is a product of cognitive automation. Interact with codes, prompts, and built artifacts inside with care. 
 
-![](https://i.postimg.cc/jqBH3SD0/STIIITCH-2026-08-20-07-43-05.png)
+## 螢幕截圖
+![IMG-1561](https://i.postimg.cc/nV1QDy5G/IMG-1561.png) ![IMG-1563](https://i.postimg.cc/59mFChGP/IMG-1563.png) ![IMG-1564](https://i.postimg.cc/xjPbzw7x/IMG-1564.png) ![IMG-1565](https://i.postimg.cc/h407dkwL/IMG-1565.jpg)
+
 
 ## 專案內容
 
