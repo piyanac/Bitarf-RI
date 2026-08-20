@@ -1,0 +1,25 @@
+# Agent / human working notes — not tracked
+Docs/
+Human Only/
+tests/
+References/
+AGENTS.md
+
+# Build artifacts
+.DerivedData/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+.build/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+*.p12
+*.mobileprovision
+
+# Finder custom-icon resource fork stub (filename is "Icon" + CR)
+Icon

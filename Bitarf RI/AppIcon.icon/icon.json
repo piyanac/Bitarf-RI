@@ -1,0 +1,115 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.26052,0.26052,0.26052,1.00000",
+      "srgb:0.12984,0.12985,0.12984,1.00000"
+    ],
+    "orientation" : {
+      "start" : {
+        "x" : 0.5,
+        "y" : 0
+      },
+      "stop" : {
+        "x" : 0.5,
+        "y" : 0.7
+      }
+    }
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "tongkong.png",
+          "name" : "tongkong",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -72.87031249999995,
+              12.6640625
+            ]
+          }
+        },
+        {
+          "image-name" : "yanwo.png",
+          "name" : "yanwo",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -75.67031249999991,
+              15.064062500000091
+            ]
+          }
+        },
+        {
+          "image-name" : "bizi.png",
+          "name" : "bizi",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -135.0703125,
+              90.6640625
+            ]
+          }
+        },
+        {
+          "image-name" : "erduo.png",
+          "name" : "erduo",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              87.89531250000005,
+              -93.8359375
+            ]
+          }
+        },
+        {
+          "image-name" : "shetou.png",
+          "name" : "shetou",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -256.87031250000007,
+              185.875
+            ]
+          }
+        },
+        {
+          "image-name" : "zuiba.png",
+          "name" : "zuiba",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -204.765625,
+              139.5
+            ]
+          }
+        },
+        {
+          "image-name" : "lunkuo.png",
+          "name" : "lunkuo",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              -234.8046875,
+              233.0078125
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
