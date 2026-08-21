@@ -71,9 +71,38 @@ final class EditorState: ObservableObject {
             if editingTextID == nil {
                 textSelection = nil
                 isTextEditingSuspended = false
+                editingCell = nil
             }
         }
     }
+
+    /// Which cell of `editingTextID`'s table is being edited, or nil when the
+    /// object being edited is a plain text box.
+    ///
+    /// Deliberately a second property rather than a richer `editingTextID`: the
+    /// text-box path is the one that has to keep working exactly as it does, and
+    /// every existing `editingTextID = nil` clears this too.
+    @Published var editingCell: TableCellAddress? {
+        didSet {
+            // The block follows the caret, so stepping through cells with ⇥
+            // leaves the one you stopped on highlighted rather than leaving a
+            // block behind somewhere the user has walked away from. Clearing
+            // the caret deliberately does *not* clear the block: coming out of
+            // a cell should leave that cell in hand.
+            if let editingCell { tableSelection = TableCellRange(editingCell) }
+        }
+    }
+
+    /// The block of cells picked out on the selected table, with no cell being
+    /// edited. Nil when the selection is not a single table, or when nothing
+    /// inside it has been pointed at yet.
+    ///
+    /// This is a selection *within* one object, so it is cleared by the same
+    /// call that changes which objects are selected — see `setSelection`.
+    /// Formatting and the structure commands read it: 「這幾格」 and 「這張表」
+    /// are different commands, and answering the wrong one rewrites cells the
+    /// user was not looking at.
+    @Published var tableSelection: TableCellRange?
 
     /// What is selected *inside* the box being edited, in UTF-16 offsets over
     /// the box's plain text. Nil when no box is being edited.
@@ -136,10 +165,11 @@ final class EditorState: ObservableObject {
     /// Transient banner text for failures that are not worth an alert.
     @Published var statusMessage: String?
 
-    /// Top of the visible canvas region, in dots. Deliberately *not* published:
-    /// it changes on every scroll frame and only matters at the moment an object
-    /// is inserted, so republishing it would redraw the whole UI for nothing.
-    var visibleTopDots: CGFloat = 0
+    /// The part of the canvas the user can currently see, in dots. Deliberately
+    /// *not* published: it changes on every scroll frame and only matters at the
+    /// moment an object is inserted, so republishing it would redraw the whole
+    /// UI for nothing. Empty until the canvas has laid itself out once.
+    var visibleRectDots: CGRect = .zero
 
     // MARK: Undo
 
@@ -292,12 +322,118 @@ final class EditorState: ObservableObject {
     /// Rewrite a text object's rich text from outside the live editor, telling
     /// the canvas to reload the text view rather than let it commit stale text.
     func updateRichText(_ id: UUID, _ mutate: (inout RichText) -> Void) {
+        let cells = formattingCells(for: id)
         updateObject(id) { object in
-            guard case .text(var rich) = object.content else { return }
-            mutate(&rich)
-            object.content = .text(rich)
+            switch object.content {
+            case .text(var rich):
+                mutate(&rich)
+                object.content = .text(rich)
+            case .table(var table):
+                if let targets = cells {
+                    // Editing one cell, or a block picked out on the canvas:
+                    // those cells and no others.
+                    for address in targets where table.contains(address) {
+                        var rich = table.rows[address.row][address.column]
+                        mutate(&rich)
+                        table.rows[address.row][address.column] = rich
+                    }
+                } else {
+                    // Nothing is being edited and nothing is picked out, so the
+                    // command was aimed at the table as a whole — which for a
+                    // font or an alignment means every cell in it.
+                    for row in table.rows.indices {
+                        for column in table.rows[row].indices {
+                            mutate(&table.rows[row][column])
+                        }
+                    }
+                }
+                object.content = .table(table)
+            default:
+                return
+            }
         }
         liveTextRevision &+= 1
+    }
+
+    /// The cell a text command should land in: the one being edited, when it is
+    /// this object's and still in range. Nil means "the whole object".
+    func formattingCell(for id: UUID) -> TableCellAddress? {
+        guard editingTextID == id, let cell = editingCell else { return nil }
+        guard document[id]?.table?.contains(cell) == true else { return nil }
+        return cell
+    }
+
+    /// The cells a text command should land in: the one being edited, or the
+    /// block picked out on the canvas. Nil means "every cell in the table",
+    /// which is what an untouched table still answers.
+    func formattingCells(for id: UUID) -> [TableCellAddress]? {
+        guard let table = document[id]?.table else { return nil }
+        if let cell = formattingCell(for: id) { return [cell] }
+        guard let range = tableRange(for: id) else { return nil }
+        return range.cells
+    }
+
+    /// The block picked out on `id`, clamped to the table as it is now.
+    ///
+    /// Clamped on every read rather than repaired on every edit: rows and
+    /// columns come and go from several places, and a selection that outlived
+    /// one of them would be an out-of-range index at the next command.
+    func tableRange(for id: UUID) -> TableCellRange? {
+        guard selectedIDs == [id],
+              let table = document[id]?.table,
+              let range = tableSelection?.clamped(to: table) else { return nil }
+        return range
+    }
+
+    /// The rich text the formatting controls are reading, for either kind of
+    /// object.
+    func formattingRichText(for id: UUID) -> RichText? {
+        guard let object = document[id] else { return nil }
+        if let rich = object.richText { return rich }
+        guard let table = object.table else { return nil }
+        if let cell = formattingCell(for: id) { return table[cell] }
+        if let range = tableRange(for: id) { return table[range.topLeft] }
+        return table.rows.first?.first
+    }
+
+    // MARK: - Table cell selection
+
+    /// Point at one cell, starting a new block.
+    func selectTableCell(_ id: UUID, _ address: TableCellAddress) {
+        guard document[id]?.table?.contains(address) == true else { return }
+        if selectedIDs != [id] { select(id) }
+        tableSelection = TableCellRange(address)
+    }
+
+    /// Drag one end of the block to `address`.
+    func extendTableSelection(_ id: UUID, to address: TableCellAddress, fromAnchorEnd: Bool = false) {
+        guard let table = document[id]?.table, table.contains(address) else { return }
+        let current = tableSelection?.clamped(to: table) ?? TableCellRange(address)
+        tableSelection = fromAnchorEnd
+            ? current.extendedFromOpposite(to: address)
+            : current.extended(to: address)
+    }
+
+    func selectTableRow(_ id: UUID, _ row: Int) {
+        guard let table = document[id]?.table, row >= 0, row < table.rowCount else { return }
+        if selectedIDs != [id] { select(id) }
+        tableSelection = .row(row, in: table)
+    }
+
+    func selectTableColumn(_ id: UUID, _ column: Int) {
+        guard let table = document[id]?.table, column >= 0, column < table.columnCount else { return }
+        if selectedIDs != [id] { select(id) }
+        tableSelection = .column(column, in: table)
+    }
+
+    /// What the structure commands act on when nothing is being edited and
+    /// nothing has been pointed at: the last cell, so the buttons always mean
+    /// something.
+    func tableCommandRange(for id: UUID) -> TableCellRange? {
+        guard let table = document[id]?.table else { return nil }
+        if let cell = formattingCell(for: id) { return TableCellRange(cell) }
+        if let range = tableRange(for: id) { return range }
+        return TableCellRange(TableCellAddress(row: table.rowCount - 1, column: table.columnCount - 1))
     }
 
     /// Begin a continuous gesture. Everything until `endInteraction` becomes one
@@ -399,7 +535,7 @@ final class EditorState: ObservableObject {
     /// Both the SwiftUI format panel and the UIKit keyboard accessory ask here,
     /// so selection handling cannot drift between the two surfaces.
     func formattingRunStyle(for id: UUID) -> RunStyle? {
-        guard let rich = document[id]?.richText else { return nil }
+        guard let rich = formattingRichText(for: id) else { return nil }
         guard editingTextID == id, let range = formattingRange else { return rich.leadingRunStyle }
         return rich.runStyle(in: range)
     }
@@ -428,6 +564,35 @@ final class EditorState: ObservableObject {
         }
     }
 
+    /// The paragraph style the formatting controls should display — the same
+    /// selection rules the run style follows, so the accessory and the format
+    /// sheet cannot disagree about which line they are talking about.
+    func formattingParagraphStyle(for id: UUID) -> ParagraphStyle? {
+        guard let rich = formattingRichText(for: id) else { return nil }
+        guard editingTextID == id, let range = formattingRange ?? textSelection.map({ $0.lowerBound..<$0.upperBound }) else {
+            return rich.leadingParagraphStyle
+        }
+        return rich.paragraphStyle(in: range)
+    }
+
+    /// Apply paragraph formatting to the lines the selection touches, or to
+    /// every paragraph when nothing is selected.
+    func updateFormattingParagraphStyle(
+        for id: UUID,
+        _ transform: (inout ParagraphStyle) -> Void
+    ) {
+        updateRichText(id) { rich in
+            if editingTextID == id,
+               let range = formattingRange ?? textSelection.map({ $0.lowerBound..<$0.upperBound }) {
+                rich.applyParagraphStyle(in: range, transform)
+                return
+            }
+            for index in rich.paragraphs.indices {
+                transform(&rich.paragraphs[index].style)
+            }
+        }
+    }
+
     func select(_ id: UUID?) {
         setSelection(id.map { [$0] } ?? [])
     }
@@ -441,6 +606,7 @@ final class EditorState: ObservableObject {
         if let editingTextID, ids != [editingTextID] {
             self.editingTextID = nil
         }
+        if ids != selectedIDs { tableSelection = nil }
         selectedIDs = ids
     }
 
@@ -521,25 +687,41 @@ final class EditorState: ObservableObject {
 
     // MARK: - Object creation
 
-    /// Place a new object near the top of what the user is currently looking at,
-    /// not at the top of a two-metre canvas they scrolled away from.
-    private func insertionOrigin(size: CGSize, visibleTop: CGFloat) -> DotPoint {
-        if document.orientation.isPortrait {
-            let x = max(document.margin, (document.canvasWidth - size.width) / 2)
-            return DotPoint(x: x, y: max(document.margin, visibleTop + 24))
-        } else {
-            let y = max(document.margin, (document.canvasHeight - size.height) / 2)
-            return DotPoint(x: max(document.margin, visibleTop + 24), y: y)
-        }
+    /// Place a new object in the middle of what the user is currently looking at,
+    /// not at one fixed spot on a two-metre canvas — which is what made every
+    /// new object land on top of the last one.
+    ///
+    /// The region is the visible rectangle clipped to the paper, so scrolling
+    /// past either end still centres on paper rather than on the grey around it.
+    /// An empty rectangle means nobody has reported a viewport yet: fall back to
+    /// the whole canvas, which is what the first object on a fresh document gets.
+    private func insertionOrigin(size: CGSize, visibleRect: CGRect) -> DotPoint {
+        let canvas = CGRect(x: 0, y: 0, width: document.canvasWidth, height: document.canvasHeight)
+        let clipped = visibleRect.intersection(canvas)
+        let region = (clipped.width > 1 && clipped.height > 1) ? clipped : canvas
+        return DotPoint(
+            x: placed(region.midX - size.width / 2, extent: size.width, within: document.canvasWidth),
+            y: placed(region.midY - size.height / 2, extent: size.height, within: document.canvasHeight)
+        )
+    }
+
+    /// Keep one axis of a new object inside the margins — unless it is wider
+    /// than the space between them, in which case the margin itself is the best
+    /// we can do and the object simply runs long.
+    private func placed(_ value: CGFloat, extent: CGFloat, within axis: CGFloat) -> CGFloat {
+        let lower = document.margin
+        let upper = axis - document.margin - extent
+        guard upper > lower else { return lower }
+        return min(max(value, lower), upper).rounded()
     }
 
     @discardableResult
-    func addTextBox(visibleTop: CGFloat = 0) -> UUID {
+    func addTextBox(visibleRect: CGRect = .zero) -> UUID {
         let width = defaultObjectWidth
         let rich = RichText(text: "", runStyle: RunStyle(fontSize: 26))
         let height = TextLayoutEngine.measureHeight(rich, width: width)
         let object = CanvasObject(
-            origin: insertionOrigin(size: CGSize(width: width, height: height), visibleTop: visibleTop),
+            origin: insertionOrigin(size: CGSize(width: width, height: height), visibleRect: visibleRect),
             size: DotSize(width: width, height: height),
             content: .text(rich)
         )
@@ -549,8 +731,208 @@ final class EditorState: ObservableObject {
         return object.id
     }
 
+    /// Drop a 3 × 3 table and put the caret in its first cell.
+    ///
+    /// Like a text box: the width is the paper's, and the height is whatever the
+    /// rows measure to — `apply` reflows, so the size below is only a seed.
     @discardableResult
-    func addShape(_ kind: ShapeKind, visibleTop: CGFloat = 0) -> UUID {
+    func addTable(visibleRect: CGRect = .zero) -> UUID {
+        let width = defaultObjectWidth
+        let content = TableContent()
+        let height = TableLayout.totalHeight(content, width: width)
+        let object = CanvasObject(
+            origin: insertionOrigin(size: CGSize(width: width, height: height), visibleRect: visibleRect),
+            size: DotSize(width: width, height: height),
+            content: .table(content)
+        )
+        apply { $0.objects.append(object) }
+        select(object.id)
+        editingTextID = object.id
+        editingCell = TableCellAddress(row: 0, column: 0)
+        return object.id
+    }
+
+    // MARK: - Table structure
+
+    /// Every structural edit goes through here, so each one is a single undo
+    /// step and the object is reflowed to its new height on the way out.
+    private func updateTable(_ id: UUID, _ mutate: (inout TableContent) -> Void) {
+        updateObject(id) { object in
+            guard case .table(var content) = object.content else { return }
+            mutate(&content)
+            content.normalize()
+            object.content = .table(content)
+        }
+        liveTextRevision &+= 1
+    }
+
+    /// One row, for the caret walking off the end of the table. Everything the
+    /// panel offers goes through the range commands below instead.
+    func insertTableRow(_ id: UUID, at index: Int) {
+        updateTable(id) { $0.insertRow(at: index) }
+    }
+
+    // MARK: Range commands
+
+    /// Insert `count` rows at `index` as one undo step. A block of three rows
+    /// selected means "three more rows", the way every table editor answers it.
+    func insertTableRows(_ id: UUID, at index: Int, count: Int) {
+        guard count > 0 else { return }
+        updateTable(id) { content in
+            for offset in 0..<count {
+                content.insertRow(at: index + offset)
+            }
+        }
+        if let table = document[id]?.table, let range = tableSelection?.clamped(to: table) {
+            tableSelection = range
+        }
+    }
+
+    func removeTableRows(_ id: UUID, _ rows: ClosedRange<Int>) {
+        guard let table = document[id]?.table else { return }
+        let count = rows.count
+        guard table.rowCount > count else {
+            statusMessage = "表格至少要有一列"
+            return
+        }
+        if let cell = editingCell, rows.contains(cell.row) { editingTextID = nil }
+        updateTable(id) { content in
+            for row in rows.reversed() {
+                content.removeRow(at: row)
+            }
+        }
+        collapseTableSelection(id, toRow: rows.lowerBound)
+    }
+
+    func insertTableColumns(_ id: UUID, at index: Int, count: Int) {
+        guard count > 0 else { return }
+        updateTable(id) { content in
+            for offset in 0..<count {
+                content.insertColumn(at: index + offset)
+            }
+        }
+        if let table = document[id]?.table, let range = tableSelection?.clamped(to: table) {
+            tableSelection = range
+        }
+    }
+
+    func removeTableColumns(_ id: UUID, _ columns: ClosedRange<Int>) {
+        guard let table = document[id]?.table else { return }
+        let count = columns.count
+        guard table.columnCount > count else {
+            statusMessage = "表格至少要有一欄"
+            return
+        }
+        if let cell = editingCell, columns.contains(cell.column) { editingTextID = nil }
+        updateTable(id) { content in
+            for column in columns.reversed() {
+                content.removeColumn(at: column)
+            }
+        }
+        collapseTableSelection(id, toColumn: columns.lowerBound)
+    }
+
+    /// After a delete the block has to land somewhere real: the cell that took
+    /// the removed one's place, or the new last one.
+    private func collapseTableSelection(_ id: UUID, toRow row: Int? = nil, toColumn column: Int? = nil) {
+        guard let table = document[id]?.table, tableSelection != nil else { return }
+        let target = TableCellAddress(
+            row: min(row ?? tableSelection?.topLeft.row ?? 0, table.rowCount - 1),
+            column: min(column ?? tableSelection?.topLeft.column ?? 0, table.columnCount - 1)
+        )
+        tableSelection = TableCellRange(target).clamped(to: table)
+    }
+
+    /// Pin a row's height, or hand it back to its text with nil.
+    func setTableRowHeight(_ id: UUID, row: Int, height: CGFloat?) {
+        updateTable(id) { $0.setRowHeight(row, to: height) }
+    }
+
+    func clearTableRowHeights(_ id: UUID) {
+        updateTable(id) { $0.clearRowHeights() }
+    }
+
+    func equalizeTableColumns(_ id: UUID) {
+        updateTable(id) { $0.equalizeColumns() }
+    }
+
+    /// Set one column's width in dots, taking the difference from its
+    /// neighbour so the table's own width does not move.
+    func setTableColumnWidth(_ id: UUID, column: Int, width: CGFloat) {
+        guard let object = document[id], let content = object.table else { return }
+        let current = TableLayout.columnWidths(content, width: object.size.width)
+        guard column >= 0, column < current.count else { return }
+        // The rule to the right of a column is the one that moves it; the last
+        // column has none, so it borrows the rule on its left instead.
+        let divider = column == content.columnCount - 1 ? column - 1 : column
+        guard divider >= 0 else { return }
+        let delta = column == divider ? width - current[column] : current[column] - width
+        updateTable(id) { content in
+            content = TableLayout.resizingColumns(
+                content,
+                divider: divider,
+                by: delta,
+                width: object.size.width
+            )
+        }
+    }
+
+    /// Set the alignment of every column the block touches.
+    func setTableColumnsAlignment(_ id: UUID, columns: ClosedRange<Int>, alignment: TextAlignment) {
+        updateTable(id) { content in
+            for column in columns where column >= 0 && column < content.columnCount {
+                content.columns[column].alignment = alignment
+            }
+        }
+    }
+
+    func setTableBorderStyle(_ id: UUID, _ style: TableBorderStyle) {
+        updateTable(id) { $0.borderStyle = style }
+    }
+
+    func setTableBorderWidth(_ id: UUID, _ width: CGFloat) {
+        updateTable(id) { $0.borderWidth = max(0, width) }
+    }
+
+    func setTableCellPadding(_ id: UUID, _ padding: CGFloat) {
+        updateTable(id) { $0.cellPadding = max(0, padding) }
+    }
+
+    /// Move the caret to the next (or previous) cell, reading order. Tabbing
+    /// off the last cell adds a row, the way every table anyone has used does.
+    func advanceEditingCell(reverse: Bool = false) {
+        guard let id = editingTextID,
+              let cell = editingCell,
+              let content = document[id]?.table else { return }
+
+        var index = cell.row * content.columnCount + cell.column + (reverse ? -1 : 1)
+        if index < 0 { return }
+        if index >= content.rowCount * content.columnCount {
+            guard !reverse else { return }
+            insertTableRow(id, at: content.rowCount)
+            index = content.rowCount * content.columnCount
+        }
+        let columns = (document[id]?.table?.columnCount ?? content.columnCount)
+        editingCell = TableCellAddress(row: index / columns, column: index % columns)
+        textSelection = nil
+    }
+
+    /// One column to the right, staying on this row.
+    ///
+    /// Deliberately not 下一格: it never wraps to the next row and never grows
+    /// the table, so filling a row across cannot run off the end into a row the
+    /// user did not ask for. At the last column it does nothing.
+    func moveEditingCellRight() {
+        guard let id = editingTextID,
+              let cell = editingCell,
+              let content = document[id]?.table else { return }
+        guard cell.column + 1 < content.columnCount else { return }
+        editingCell = TableCellAddress(row: cell.row, column: cell.column + 1)
+        textSelection = nil
+    }
+
+    @discardableResult
+    func addShape(_ kind: ShapeKind, visibleRect: CGRect = .zero) -> UUID {
         let size: CGSize
         switch kind {
         case .rectangle: size = CGSize(width: defaultObjectWidth, height: 120)
@@ -563,7 +945,7 @@ final class EditorState: ObservableObject {
             filled: false
         )
         let object = CanvasObject(
-            origin: insertionOrigin(size: size, visibleTop: visibleTop),
+            origin: insertionOrigin(size: size, visibleRect: visibleRect),
             size: DotSize(size),
             content: .shape(content)
         )
@@ -573,21 +955,20 @@ final class EditorState: ObservableObject {
     }
 
     @discardableResult
-    func addImage(_ image: UIImage, visibleTop: CGFloat = 0) -> UUID? {
+    func addImage(_ image: UIImage, visibleRect: CGRect = .zero) -> UUID? {
         guard let source = image.cgImage else {
             statusMessage = "載入圖片失敗"
             return nil
         }
-        // Downsample on the way in because the document stores image bytes.
-        // 此處應插入經典機型固定軸所衍生的圖片儲存上限。
-        let cgImage = Self.downsampled(source, maxWidth: Self.storedImageMaxWidth)
+        // 此處應插入經典機型輸出尺寸衍生的匯入影像降採樣上限。
+        let cgImage = source
         guard let png = UIImage(cgImage: cgImage).pngData() else {
             statusMessage = "載入圖片失敗"
             return nil
         }
         let pixelSize = CGSize(width: cgImage.width, height: cgImage.height)
-        // Scale to the canvas rather than to the photo's own pixel count — a
-        // 此處應插入經典機型解析度所衍生的畫布縮放策略。
+        // Scale to the canvas rather than to the photo's own pixel count.
+        // 此處應插入經典機型列印頭寬度對影像縮放的理由。
         let maxWidth = defaultObjectWidth
         let scale = min(1, maxWidth / max(pixelSize.width, 1))
         let size = CGSize(
@@ -595,7 +976,7 @@ final class EditorState: ObservableObject {
             height: max(8, (pixelSize.height * scale).rounded())
         )
         let object = CanvasObject(
-            origin: insertionOrigin(size: size, visibleTop: visibleTop),
+            origin: insertionOrigin(size: size, visibleRect: visibleRect),
             size: DotSize(size),
             content: .image(ImageContent(pngData: png, pixelSize: DotSize(pixelSize)))
         )
@@ -610,7 +991,7 @@ final class EditorState: ObservableObject {
     /// native resolution — so it always arrives as wide as the paper allows and
     /// keeps its own proportions from there.
     @discardableResult
-    func addVector(_ content: VectorContent, visibleTop: CGFloat = 0) -> UUID? {
+    func addVector(_ content: VectorContent, visibleRect: CGRect = .zero) -> UUID? {
         let intrinsic = content.intrinsicSize
         guard intrinsic.width > 0, intrinsic.height > 0 else {
             statusMessage = "這個向量沒有尺寸"
@@ -622,7 +1003,7 @@ final class EditorState: ObservableObject {
             height: max(8, (width * intrinsic.height / intrinsic.width).rounded())
         )
         let object = CanvasObject(
-            origin: insertionOrigin(size: size, visibleTop: visibleTop),
+            origin: insertionOrigin(size: size, visibleRect: visibleRect),
             size: DotSize(size),
             content: .vector(content)
         )
@@ -631,7 +1012,7 @@ final class EditorState: ObservableObject {
         return object.id
     }
 
-    // 此處應插入經典機型所衍生的 storedImageMaxWidth。
+    // 此處應插入經典機型固定軸上限所衍生的影像儲存寬度。
 
     /// `image` scaled so it is no wider than `maxWidth`, or itself if it already
     /// fits.
@@ -866,10 +1247,7 @@ final class EditorState: ObservableObject {
         }
     }
 
-    func setFixedAxis(_ dots: Int) {
-        let clamped = min(max(dots, CanvasMetrics.fixedAxisRange.lowerBound), CanvasMetrics.fixedAxisRange.upperBound)
-        apply { $0.fixedAxisDots = CanvasMetrics.byteAligned(clamped) }
-    }
+    // 此處應插入經典機型固定軸範圍的設定操作。
 
     func setDither(_ algorithm: DitherAlgorithm) {
         apply { $0.dither = algorithm }
@@ -879,7 +1257,7 @@ final class EditorState: ObservableObject {
         apply { $0.threshold = UInt8(min(max(threshold, 1), 254)) }
     }
 
-    // 此處應插入經典機型的濃度與尾端走紙 setter 及有效範圍。
+    // 此處應插入經典機型濃度與尾端走紙範圍的設定操作。
 
     func setMargin(_ margin: CGFloat) {
         apply { $0.margin = min(max(margin, 0), 64) }

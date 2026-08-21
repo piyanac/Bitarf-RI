@@ -25,6 +25,15 @@ public struct CanvasRenderOptions {
     /// Skip this object — the editor hides the object being live-edited in a
     /// text view so the glyphs are not drawn twice.
     public var suppressedObjectID: UUID?
+    /// Skip one cell of `suppressedObjectID`'s table, for the same reason. When
+    /// this is set the table itself is still drawn — only the cell under the
+    /// live text view is left blank.
+    public var suppressedCell: TableCellAddress?
+    /// Stroke table rules here. Off for the print raster, which lays the rules
+    /// down afterwards as whole dots — see ``TableRuleRaster``. A rotated table
+    /// is stroked either way, because a whole-dot rectangle cannot describe a
+    /// rule at an angle.
+    public var drawsTableRules: Bool
 
     public init(
         drawsBackground: Bool = true,
@@ -32,7 +41,9 @@ public struct CanvasRenderOptions {
         backgroundColor: CGColor = CanvasRenderOptions.white,
         showsMarginGuide: Bool = false,
         showsEmptyTextPlaceholder: Bool = false,
-        suppressedObjectID: UUID? = nil
+        suppressedObjectID: UUID? = nil,
+        suppressedCell: TableCellAddress? = nil,
+        drawsTableRules: Bool = true
     ) {
         self.drawsBackground = drawsBackground
         self.inkColor = inkColor
@@ -40,6 +51,8 @@ public struct CanvasRenderOptions {
         self.showsMarginGuide = showsMarginGuide
         self.showsEmptyTextPlaceholder = showsEmptyTextPlaceholder
         self.suppressedObjectID = suppressedObjectID
+        self.suppressedCell = suppressedCell
+        self.drawsTableRules = drawsTableRules
     }
 
     public static let black = CGColor(gray: 0, alpha: 1)
@@ -86,7 +99,11 @@ public enum CanvasRenderer {
         }
 
         for object in document.objects where !object.isHidden {
-            if let suppressed = options.suppressedObjectID, suppressed == object.id { continue }
+            // A suppressed *cell* still wants its table drawn; only a whole
+            // suppressed object disappears.
+            if let suppressed = options.suppressedObjectID,
+               suppressed == object.id,
+               options.suppressedCell == nil { continue }
             draw(object: object, in: context, options: options)
         }
     }
@@ -118,6 +135,8 @@ public enum CanvasRenderer {
             drawImage(image, object: object, in: context)
         case .vector(let vector):
             drawVector(vector, object: object, in: context)
+        case .table(let table):
+            drawTable(table, object: object, in: context, options: options)
         }
     }
 
@@ -141,6 +160,63 @@ public enum CanvasRenderer {
 
         let attributed = rich.attributedString(foreground: options.inkColor)
         TextLayoutEngine.draw(attributed, in: object.frame, context: context)
+    }
+
+    // MARK: - Tables
+
+    private static func drawTable(
+        _ table: TableContent,
+        object: CanvasObject,
+        in context: CGContext,
+        options: CanvasRenderOptions
+    ) {
+        let frame = object.frame
+        guard frame.width > 0, frame.height > 0 else { return }
+
+        let columns = TableLayout.columnEdges(table, width: frame.width)
+        let rows = TableLayout.rowEdges(table, width: frame.width)
+        // The measured rows are the truth about where the rules go; the object's
+        // stored height is only a cache of their total and can be a frame behind
+        // during a live edit.
+        let bottom = frame.minY + (rows.last ?? frame.height)
+
+        if table.borderStyle != .none, table.borderWidth > 0,
+           options.drawsTableRules || object.rotation != 0 {
+            context.saveGState()
+            context.setStrokeColor(options.inkColor)
+            context.setLineWidth(table.borderWidth)
+            context.setLineCap(.square)
+
+            for edge in rows {
+                context.move(to: CGPoint(x: frame.minX, y: frame.minY + edge))
+                context.addLine(to: CGPoint(x: frame.maxX, y: frame.minY + edge))
+            }
+            if table.borderStyle == .grid {
+                for edge in columns {
+                    context.move(to: CGPoint(x: frame.minX + edge, y: frame.minY))
+                    context.addLine(to: CGPoint(x: frame.minX + edge, y: bottom))
+                }
+            }
+            context.strokePath()
+            context.restoreGState()
+        }
+
+        let suppressed = options.suppressedObjectID == object.id ? options.suppressedCell : nil
+        for row in 0..<table.rowCount {
+            for column in 0..<table.columnCount {
+                let address = TableCellAddress(row: row, column: column)
+                if address == suppressed { continue }
+                guard let cell = table[address],
+                      !cell.isEmpty,
+                      let rect = TableLayout.textRect(address, content: table, frame: frame) else { continue }
+                let aligned = cell.aligned(to: table.columns[column].alignment)
+                TextLayoutEngine.draw(
+                    aligned.attributedString(foreground: options.inkColor),
+                    in: rect,
+                    context: context
+                )
+            }
+        }
     }
 
     // MARK: - Shapes

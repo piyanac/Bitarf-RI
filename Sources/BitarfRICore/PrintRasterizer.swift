@@ -45,13 +45,13 @@ public enum PrintRasterizer {
         threshold: UInt8? = nil,
         trimTrailingBlank: Bool = true
     ) -> PrintRasterResult {
-        let canvasGray = rasterizeGray(document: document)
+        // Table rules are left out of the grey pass and stamped on as whole
+        // dots afterwards, so a ruled line is the same crisp line under every
+        // algorithm instead of a dithered smear. See ``TableRuleRaster``.
+        let rules = TableRuleRaster.rules(in: document.reflowed)
+        var canvasGray = rasterizeGray(document: document, includingTableRules: rules.isEmpty)
         let landscape = !document.orientation.isPortrait
         let cut = threshold ?? document.threshold
-
-        // Draw in canvas space, then turn the strip so the fixed axis lands on
-        // the head. The gray preview is turned with it so the two panes agree.
-        let headGray = landscape ? rotatedGray90Clockwise(canvasGray) : canvasGray
 
         var bitmap = Dither.apply(
             algorithm ?? document.dither,
@@ -69,6 +69,11 @@ public enum PrintRasterizer {
                 into: &bitmap
             )
         }
+        for rule in rules {
+            bitmap.fillBlack(rule)
+        }
+        // Drawn in canvas space; now turn the strip so the fixed axis lands on
+        // the head. The grey preview is turned with it so the two panes agree.
         if landscape {
             bitmap = bitmap.rotated90Clockwise()
         }
@@ -76,12 +81,22 @@ public enum PrintRasterizer {
             bitmap = bitmap.trimmingTrailingBlankRows()
         }
 
+        // The preview's "before" pane gets the rules back, so the two panes
+        // still show the same drawing.
+        for rule in rules {
+            canvasGray.fillBlack(rule)
+        }
+        let headGray = landscape ? rotatedGray90Clockwise(canvasGray) : canvasGray
+
         return PrintRasterResult(bitmap: bitmap, gray: headGray, lengthDots: bitmap.height)
     }
 
     /// Grayscale-only pass, in canvas space (not rotated), for the preview
     /// screen's "before" image and for anything that wants the raw render.
-    public static func rasterizeGray(document: BitarfDocument) -> GrayBuffer {
+    public static func rasterizeGray(
+        document: BitarfDocument,
+        includingTableRules: Bool = true
+    ) -> GrayBuffer {
         let reflowed = document.reflowed
         let size = reflowed.canvasSize
         let width = clampedDots(size.width)
@@ -108,7 +123,9 @@ public enum PrintRasterizer {
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
         context.interpolationQuality = .high
-        CanvasRenderer.draw(document: reflowed, in: context, options: .print)
+        var options = CanvasRenderOptions.print
+        options.drawsTableRules = includingTableRules
+        CanvasRenderer.draw(document: reflowed, in: context, options: options)
 
         guard let data = context.data else {
             return GrayBuffer(width: width, height: height, fill: 255)

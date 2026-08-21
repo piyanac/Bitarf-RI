@@ -58,6 +58,17 @@ final class CanvasViewController: UIViewController {
         /// case, so there is no second code path to keep in step.
         case move(startOrigins: [UUID: CGPoint], startUnion: CGRect)
         case resize(handle: CanvasHandle, anchor: CGPoint, startObject: CanvasObject)
+        /// Dragging the rule between column `index` and `index + 1` of a table.
+        case resizeColumn(index: Int, startObject: CanvasObject)
+        /// Dragging the rule below row `index`. The heights are captured at the
+        /// start because the row's own height is what the drag adds to, and
+        /// re-reading it each frame would compound the rounding.
+        case resizeRow(index: Int, startObject: CanvasObject, startHeights: [CGFloat])
+        /// Dragging a table's bottom edge, which is every row at once.
+        case resizeAllRows(startObject: CanvasObject, startHeights: [CGFloat])
+        /// Dragging one end of the cell block. `fromAnchorEnd` is the top-left
+        /// grip, which moves the anchor and leaves the far corner standing.
+        case tableRange(objectID: UUID, fromAnchorEnd: Bool)
         case rotate(startRotation: CGFloat, startAngle: CGFloat, centre: CGPoint)
         /// Turning a whole selection. `startObjects` and `centre` are both
         /// captured once here and never recomputed: an axis-aligned union swells
@@ -84,6 +95,14 @@ final class CanvasViewController: UIViewController {
 
     /// Horizontal / vertical padding around the sheet, in points.
     private let canvasPadding: CGFloat = 12
+
+    /// How far the chrome overlay reaches past the paper, in points.
+    ///
+    /// A `draw(_:)` is clipped to its view's bounds, and a table's header bars
+    /// and rotation handle both sit *outside* the object — which for an object
+    /// against the edge of the sheet is outside the sheet. The overlay is grown
+    /// instead, and every point handed to it carries this offset.
+    private let overlayMargin: CGFloat = 44
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -140,6 +159,23 @@ final class CanvasViewController: UIViewController {
         layoutCanvas()
     }
 
+    /// Tell the editor what part of the paper is on screen, in dots, so a new
+    /// object can be dropped in the middle of it. `adjustedContentInset` is the
+    /// right inset here — unlike the scale above, an object inserted while the
+    /// keyboard is up should land in the strip still visible above it.
+    private func publishVisibleRect() {
+        let scale = max(contentView.displayScale, 0.0001)
+        let visible = scrollView.bounds.inset(by: scrollView.adjustedContentInset)
+        guard visible.width > 1, visible.height > 1 else { return }
+        let inCanvas = contentView.convert(visible, from: scrollView)
+        editor.visibleRectDots = CGRect(
+            x: inCanvas.minX / scale,
+            y: inCanvas.minY / scale,
+            width: inCanvas.width / scale,
+            height: inCanvas.height / scale
+        )
+    }
+
     /// Wake the text input system up before the user needs it.
     ///
     /// Two costs land on the first box edited in the app's life, and both of
@@ -188,10 +224,8 @@ final class CanvasViewController: UIViewController {
         let available = scrollView.bounds.inset(by: scrollView.safeAreaInsets).size
         guard available.width > 1, available.height > 1 else { return }
 
-        // The fixed axis is what has to fit.
-        // 此處應插入經典機型固定軸的縮放案例。
-        // iPhone that lands at roughly 1 dot == 1 pt, which is the whole reason
-        // this app is phone-first.
+        // The fixed axis is what has to fit on screen.
+        // 此處應插入經典機型固定軸尺寸的版面比例案例。
         let scale: CGFloat
         if document.orientation.isPortrait {
             scale = max(0.05, (available.width - canvasPadding * 2) / CGFloat(document.fixedAxisDots))
@@ -213,13 +247,14 @@ final class CanvasViewController: UIViewController {
 
         contentView.frame = CGRect(origin: CGPoint(x: originX, y: originY), size: canvasSize)
         contentView.layer.shadowPath = UIBezierPath(rect: contentView.bounds).cgPath
-        overlayView.frame = contentView.frame
+        overlayView.frame = contentView.frame.insetBy(dx: -overlayMargin, dy: -overlayMargin)
 
         scrollView.contentSize = CGSize(
             width: max(available.width, canvasSize.width + originX + canvasPadding),
             height: max(available.height, canvasSize.height + originY + canvasPadding)
         )
 
+        publishVisibleRect()
         refreshSelectionOverlay()
         layoutTextEditor()
     }
@@ -230,6 +265,7 @@ final class CanvasViewController: UIViewController {
         contentView.document = editor.document
         contentView.showsMarginGuide = editor.showsMarginGuide
         contentView.editingObjectID = editor.editingTextID
+        contentView.editingCell = editor.editingCell
 
         let revision = editor.liveTextRevision
         let rewrittenElsewhere = revision != seenLiveTextRevision
@@ -248,8 +284,13 @@ final class CanvasViewController: UIViewController {
         }
 
         if let object = editor.selectedObject {
-            let corners = object.corners.map(contentView.viewPoint(from:))
-            overlayView.update(corners: corners, locked: object.isLocked)
+            let corners = object.corners.map { overlayPoint(contentView.viewPoint(from: $0)) }
+            overlayView.update(
+                corners: corners,
+                locked: object.isLocked,
+                heightIsDraggable: heightIsDraggable(object)
+            )
+            refreshTableChrome(for: object)
             return
         }
 
@@ -269,12 +310,132 @@ final class CanvasViewController: UIViewController {
             CGPoint(x: union.maxX, y: union.minY),
             CGPoint(x: union.maxX, y: union.maxY),
             CGPoint(x: union.minX, y: union.maxY),
-        ].map { CGPoint(x: $0.x * scale, y: $0.y * scale) }
+        ].map { overlayPoint(CGPoint(x: $0.x * scale, y: $0.y * scale)) }
 
         overlayView.updateSelectionSet(
-            quads: members.map { (corners: $0.corners.map(contentView.viewPoint(from:)), locked: $0.isLocked) },
+            quads: members.map {
+                (corners: $0.corners.map { overlayPoint(contentView.viewPoint(from: $0)) }, locked: $0.isLocked)
+            },
             union: unionCorners
         )
+    }
+
+    /// Is this object's height its own to set?
+    ///
+    /// A text box measures its height from its content and a line has only a
+    /// length, so for those two the bottom handle would be a control the
+    /// renderer is free to ignore, and it is not offered.
+    private func heightIsDraggable(_ object: CanvasObject) -> Bool {
+        // A table's height is the sum of its rows, so the bottom handle has
+        // somewhere to put what it is given: every row takes an equal share.
+        if object.isTable { return true }
+        if object.isText { return false }
+        if case .shape(let shape) = object.content, shape.kind == .line { return false }
+        return true
+    }
+
+    // MARK: - Table chrome
+
+    /// The cell block and the rule grips for a selected table, in the overlay's
+    /// point space.
+    ///
+    /// Everything is measured in dots against the object's own upright frame and
+    /// then rotated, so a turned table's grips ride its edges instead of drifting
+    /// off into the page.
+    private func refreshTableChrome(for object: CanvasObject) {
+        guard FeatureFlags.tableEditor, let table = object.table, !object.isLocked else {
+            overlayView.updateTable(rangeCorners: [], grips: [], headers: [])
+            return
+        }
+
+        let frame = object.frame
+        let scale = max(contentView.displayScale, 0.0001)
+        let thickness = CanvasSelectionOverlayView.headerThickness / scale
+        let gap = CanvasSelectionOverlayView.headerGap / scale
+        let gripOffset = CanvasSelectionOverlayView.gripOffset / scale
+        let range = editor.tableRange(for: object.id)
+
+        let columnEdges = TableLayout.columnEdges(table, width: frame.width)
+        let rowEdges = TableLayout.rowEdges(table, width: frame.width)
+
+        var grips: [(kind: CanvasTableGrip, position: CGPoint, angle: CGFloat)] = []
+        var headers: [(kind: CanvasTableGrip, corners: [CGPoint], selected: Bool)] = []
+
+        // Column bars lie along the top edge, row bars down the left edge. A
+        // bar is the whole row or column, so every one of them can be taken in
+        // a tap; the rule grips ride the boundaries between bars.
+        for column in 0..<table.columnCount {
+            let rect = CGRect(
+                x: frame.minX + columnEdges[column],
+                y: frame.minY - gap - thickness,
+                width: columnEdges[column + 1] - columnEdges[column],
+                height: thickness
+            )
+            headers.append((
+                .columnHeader(column),
+                quad(rect, in: object),
+                range?.columnRange.contains(column) ?? false
+            ))
+        }
+        for row in 0..<table.rowCount {
+            let rect = CGRect(
+                x: frame.minX - gap - thickness,
+                y: frame.minY + rowEdges[row],
+                width: thickness,
+                height: rowEdges[row + 1] - rowEdges[row]
+            )
+            headers.append((
+                .rowHeader(row),
+                quad(rect, in: object),
+                range?.rowRange.contains(row) ?? false
+            ))
+        }
+
+        // The outer left and right edges are the object's own resize handles, so
+        // only the internal column rules get a grip. Rows are different: the
+        // last rule is the table's bottom edge, and dragging it is how the final
+        // row grows.
+        if table.columnCount > 1 {
+            for index in 0..<(table.columnCount - 1) {
+                let dot = CGPoint(x: frame.minX + columnEdges[index + 1], y: frame.minY - gripOffset)
+                grips.append((.column(index), overlayPoint(rotating: dot, in: object), object.rotation))
+            }
+        }
+        for index in 0..<table.rowCount {
+            let dot = CGPoint(x: frame.minX - gripOffset, y: frame.minY + rowEdges[index + 1])
+            grips.append((.row(index), overlayPoint(rotating: dot, in: object), object.rotation))
+        }
+
+        var rangeCorners: [CGPoint] = []
+        if let range, let rect = TableLayout.rangeRect(range, content: table, frame: frame) {
+            rangeCorners = quad(rect, in: object)
+            grips.append((.rangeStart, rangeCorners[0], object.rotation))
+            grips.append((.rangeEnd, rangeCorners[2], object.rotation))
+        }
+
+        overlayView.updateTable(rangeCorners: rangeCorners, grips: grips, headers: headers)
+    }
+
+    /// A dot-space rectangle in `object`'s upright frame, as four view-space
+    /// corners turned by the object's rotation.
+    private func quad(_ rect: CGRect, in object: CanvasObject) -> [CGPoint] {
+        [
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.maxY),
+            CGPoint(x: rect.minX, y: rect.maxY),
+        ].map { overlayPoint(rotating: $0, in: object) }
+    }
+
+    /// A dot-space point in `object`'s upright frame, turned by the object's
+    /// rotation and converted into the overlay's space.
+    private func overlayPoint(rotating dot: CGPoint, in object: CanvasObject) -> CGPoint {
+        overlayPoint(contentView.viewPoint(from: rotated(dot, in: object)))
+    }
+
+    /// A point in the content view's space, moved into the overlay's.
+    private func overlayPoint(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x + overlayMargin, y: point.y + overlayMargin)
     }
 
     // MARK: - Gestures
@@ -319,6 +480,29 @@ final class CanvasViewController: UIViewController {
         let dot = contentView.dotPoint(from: point)
         let slop = 6 / max(contentView.displayScale, 0.0001)
 
+        // The table's chrome sits outside the object, on paper that belongs to
+        // nothing, so it has to be asked about before the hit test: a tap that
+        // fell through would clear the very selection it was aimed at. A header
+        // bar takes its whole row or column — the same thing a header cell does
+        // everywhere else — and a rule grip is drag-only but still swallows the
+        // tap it caught.
+        if !editor.isSelectionMode, let object = editor.selectedObject {
+            let overlayPoint = gesture.location(in: overlayView)
+            if overlayView.grip(at: overlayPoint) != nil { return }
+            switch overlayView.header(at: overlayPoint) {
+            case .rowHeader(let index):
+                editor.selectTableRow(object.id, index)
+                UISelectionFeedbackGenerator().selectionChanged()
+                return
+            case .columnHeader(let index):
+                editor.selectTableColumn(object.id, index)
+                UISelectionFeedbackGenerator().selectionChanged()
+                return
+            default:
+                break
+            }
+        }
+
         let hits = editor.document.hitTestAll(dot, slop: slop)
 
         if editor.isSelectionMode {
@@ -334,6 +518,21 @@ final class CanvasViewController: UIViewController {
         guard let top = hits.first else {
             editMenuInteraction.dismissMenu()
             editor.select(nil)
+            return
+        }
+
+        // A tap on a table that is *already* the selection points at a cell
+        // rather than raising the edit menu again: the menu's commands are all
+        // about the object, and by this point the user has moved on to what is
+        // inside it. The menu is still one tap away — deselect, or tap the
+        // table from elsewhere.
+        if FeatureFlags.tableEditor,
+           editor.selectedID == top.id,
+           !top.isLocked,
+           let cell = tableCell(at: dot, in: top) {
+            editMenuInteraction.dismissMenu()
+            editor.selectTableCell(top.id, cell)
+            UISelectionFeedbackGenerator().selectionChanged()
             return
         }
 
@@ -354,7 +553,32 @@ final class CanvasViewController: UIViewController {
         if object.isText {
             editMenuInteraction.dismissMenu()
             beginTextEditing(object.id)
+        } else if FeatureFlags.tableEditor, let cell = tableCell(at: dot, in: object) {
+            editMenuInteraction.dismissMenu()
+            beginTextEditing(object.id, cell: cell)
         }
+    }
+
+    /// Which cell of `object`'s table `dot` lands in, in canvas space.
+    private func tableCell(at dot: CGPoint, in object: CanvasObject) -> TableCellAddress? {
+        guard let table = object.table else { return nil }
+        // The table lays out upright; rotate the point back into the object's
+        // own space before asking the grid about it.
+        return TableLayout.cell(at: unrotated(dot, in: object), content: table, frame: object.frame)
+    }
+
+    /// `point` moved into `object`'s unrotated space.
+    private func unrotated(_ point: CGPoint, in object: CanvasObject) -> CGPoint {
+        guard object.rotation != 0 else { return point }
+        let centre = object.center
+        let dx = point.x - centre.x
+        let dy = point.y - centre.y
+        let cosine = cos(-object.rotation)
+        let sine = sin(-object.rotation)
+        return CGPoint(
+            x: centre.x + dx * cosine - dy * sine,
+            y: centre.y + dx * sine + dy * cosine
+        )
     }
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
@@ -398,6 +622,28 @@ final class CanvasViewController: UIViewController {
 
             // A set offers the rotation handle and no other, so there are only
             // three ways this can begin.
+            // The table grips come first: the block's ends sit inside the object
+            // where a drag would otherwise move it, and the rule grips sit
+            // outside it where nothing would claim the touch at all.
+            if let object = editor.selectedObject,
+               let grip = overlayView.grip(at: gesture.location(in: overlayView)),
+               beginGripDrag(grip, object: object) {
+                if case .tableRange = dragMode {} else {
+                    showLoupe(focusOn: pointInContent, touch: pointInView)
+                }
+                return
+            }
+
+            // A column rule is inside the object, so it never competes with the
+            // corner handles — but it must be asked about before the drag falls
+            // through to moving the whole table.
+            if let object = editor.selectedObject,
+               let divider = columnDivider(near: contentView.dotPoint(from: pointInContent), in: object) {
+                dragMode = .resizeColumn(index: divider, startObject: object)
+                showLoupe(focusOn: pointInContent, touch: pointInView)
+                return
+            }
+
             switch (overlayView.handle(at: gesture.location(in: overlayView)), editor.selectedObject) {
             case (.some(let handle), .some(let object)):
                 beginHandleDrag(handle, object: object)
@@ -429,6 +675,49 @@ final class CanvasViewController: UIViewController {
         }
     }
 
+    /// The internal table rule under `dot`, if the flag is on and the selection
+    /// is a single unlocked table.
+    private func columnDivider(near dot: CGPoint, in object: CanvasObject) -> Int? {
+        guard FeatureFlags.tableEditor, !object.isLocked, let table = object.table else { return nil }
+        let tolerance = max(SnapEngine.defaultTolerance, 8 / max(contentView.displayScale, 0.0001))
+        return TableLayout.columnDivider(
+            near: unrotated(dot, in: object),
+            content: table,
+            frame: object.frame,
+            tolerance: tolerance
+        )
+    }
+
+    /// Start whichever drag `grip` stands for. Returns false when the grip no
+    /// longer matches the object — a stale index after an undo, say — so the
+    /// caller can fall through to the ordinary drags.
+    private func beginGripDrag(_ grip: CanvasTableGrip, object: CanvasObject) -> Bool {
+        guard let table = object.table, !object.isLocked else { return false }
+        switch grip {
+        case .rangeStart, .rangeEnd:
+            guard editor.tableRange(for: object.id) != nil else { return false }
+            dragMode = .tableRange(objectID: object.id, fromAnchorEnd: grip == .rangeStart)
+            return true
+        case .column(let index):
+            guard index >= 0, index + 1 < table.columnCount else { return false }
+            dragMode = .resizeColumn(index: index, startObject: object)
+            return true
+        case .row(let index):
+            guard index >= 0, index < table.rowCount else { return false }
+            dragMode = .resizeRow(
+                index: index,
+                startObject: object,
+                startHeights: TableLayout.rowHeights(table, width: object.size.width)
+            )
+            return true
+        case .columnHeader, .rowHeader:
+            // The bars are for tapping. A drag that started on one is the user
+            // reaching for the rule they missed, so let it move the object
+            // rather than doing nothing at all.
+            return false
+        }
+    }
+
     private func beginHandleDrag(_ handle: CanvasHandle, object: CanvasObject) {
         switch handle {
         case .rotate:
@@ -438,18 +727,33 @@ final class CanvasViewController: UIViewController {
                 startAngle: .nan, // filled in on the first .changed, where we have a point
                 centre: centre
             )
-        case .topLeft, .topRight, .bottomLeft, .bottomRight:
+        case .bottomEdge where object.isTable:
+            // Not a resize: the object's height is not a number a table keeps,
+            // so the drag has to be spent on the rows that make it up.
+            guard let table = object.table else { return }
+            dragMode = .resizeAllRows(
+                startObject: object,
+                startHeights: TableLayout.rowHeights(table, width: object.size.width)
+            )
+
+        case .bottomRight, .rightEdge, .bottomEdge:
+            // The anchor is whatever must not move: the opposite corner for the
+            // corner handle, and the opposite edge's midpoint for an edge one —
+            // an edge handle changes one axis, so the other has to stay put.
             let corners = object.corners
             let anchor: CGPoint
             switch handle {
-            case .topLeft: anchor = corners[2]
-            case .topRight: anchor = corners[3]
             case .bottomRight: anchor = corners[0]
-            case .bottomLeft: anchor = corners[1]
+            case .rightEdge: anchor = midpoint(corners[0], corners[3])
+            case .bottomEdge: anchor = midpoint(corners[0], corners[1])
             case .rotate: anchor = object.center
             }
             dragMode = .resize(handle: handle, anchor: anchor, startObject: object)
         }
+    }
+
+    private func midpoint(_ a: CGPoint, _ b: CGPoint) -> CGPoint {
+        CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
     }
 
     private func applyDrag(translation: CGPoint, pointInContent: CGPoint) {
@@ -459,6 +763,58 @@ final class CanvasViewController: UIViewController {
         switch dragMode {
         case .none:
             return
+
+        case .resizeColumn(let index, let startObject):
+            guard let table = startObject.table else { return }
+            // Rotation is a property of the object, not of the rule: measure the
+            // drag along the table's own horizontal axis.
+            let delta = (translation.x * cos(startObject.rotation)
+                + translation.y * sin(startObject.rotation)) / scale
+            let resized = TableLayout.resizingColumns(
+                table,
+                divider: index,
+                by: delta,
+                width: startObject.size.width
+            )
+            editor.updateObject(startObject.id) { $0.content = .table(resized) }
+
+        case .resizeRow(let index, let startObject, let startHeights):
+            guard let table = startObject.table else { return }
+            // Measured along the table's own vertical axis, for the same reason
+            // the column drag is measured along its horizontal one.
+            let delta = (translation.y * cos(startObject.rotation)
+                - translation.x * sin(startObject.rotation)) / scale
+            let resized = TableLayout.resizingRow(
+                table,
+                row: index,
+                by: delta,
+                width: startObject.size.width,
+                from: startHeights
+            )
+            editor.updateObject(startObject.id) { $0.content = .table(resized) }
+
+        case .resizeAllRows(let startObject, let startHeights):
+            guard let table = startObject.table else { return }
+            let delta = (translation.y * cos(startObject.rotation)
+                - translation.x * sin(startObject.rotation)) / scale
+            let resized = TableLayout.resizingAllRows(
+                table,
+                by: delta,
+                width: startObject.size.width,
+                from: startHeights
+            )
+            editor.updateObject(startObject.id) { $0.content = .table(resized) }
+
+        case .tableRange(let objectID, let fromAnchorEnd):
+            guard let object = editor.document[objectID], let table = object.table else { return }
+            let cell = TableLayout.nearestCell(
+                to: unrotated(dot, in: object),
+                content: table,
+                frame: object.frame
+            )
+            guard editor.tableSelection.map({ fromAnchorEnd ? $0.anchor : $0.focus }) != cell else { return }
+            editor.extendTableSelection(objectID, to: cell, fromAnchorEnd: fromAnchorEnd)
+            UISelectionFeedbackGenerator().selectionChanged()
 
         case .move(let startOrigins, let startUnion):
             let delta = CGPoint(x: translation.x / scale, y: translation.y / scale)
@@ -550,8 +906,13 @@ final class CanvasViewController: UIViewController {
         let localY = dx * sine + dy * cosine
 
         let minimum: CGFloat = 8
-        var newWidth = max(minimum, abs(localX).rounded())
-        var newHeight = max(minimum, abs(localY).rounded())
+        // An edge handle moves one axis and leaves the other exactly as it was.
+        var newWidth = handle == .bottomEdge
+            ? start.size.width
+            : max(minimum, abs(localX).rounded())
+        var newHeight = handle == .rightEdge
+            ? start.size.height
+            : max(minimum, abs(localY).rounded())
 
         if start.isText {
             // A text box's height is measured, never dragged — there is no page
@@ -559,17 +920,25 @@ final class CanvasViewController: UIViewController {
             // number the renderer is free to ignore.
             newHeight = start.size.height
         }
-        if case .image(let image) = start.content, image.pixelSize.width > 0 {
-            // Images keep their aspect ratio; a squashed 1-bit photo is almost
-            // never what was meant.
-            let ratio = image.pixelSize.height / image.pixelSize.width
-            newHeight = max(minimum, (newWidth * ratio).rounded())
+        // Artwork keeps its aspect ratio; a squashed 1-bit photo is almost never
+        // what was meant, and there is no formatting panel to un-squash it from.
+        // Which side leads depends on the handle: the bottom one is asking about
+        // the height, so there the width is what follows.
+        let intrinsicRatio: CGFloat?
+        switch start.content {
+        case .image(let image) where image.pixelSize.width > 0:
+            intrinsicRatio = image.pixelSize.height / image.pixelSize.width
+        case .vector(let vector) where vector.intrinsicSize.width > 0:
+            intrinsicRatio = vector.intrinsicSize.height / vector.intrinsicSize.width
+        default:
+            intrinsicRatio = nil
         }
-        if case .vector(let vector) = start.content, vector.intrinsicSize.width > 0 {
-            // Same reasoning as an image: the artwork has proportions of its
-            // own, and there is no formatting panel to un-squash it from.
-            let ratio = vector.intrinsicSize.height / vector.intrinsicSize.width
-            newHeight = max(minimum, (newWidth * ratio).rounded())
+        if let intrinsicRatio, intrinsicRatio > 0 {
+            if handle == .bottomEdge {
+                newWidth = max(minimum, (newHeight / intrinsicRatio).rounded())
+            } else {
+                newHeight = max(minimum, (newWidth * intrinsicRatio).rounded())
+            }
         }
         if case .shape(let shape) = start.content, shape.kind == .line {
             newHeight = start.size.height
@@ -577,9 +946,11 @@ final class CanvasViewController: UIViewController {
         newWidth = min(newWidth, 20_000)
         newHeight = min(newHeight, 20_000)
 
-        // Signs of the *anchor* corner in local space.
-        let anchorSignX: CGFloat = (handle == .topLeft || handle == .bottomLeft) ? 1 : -1
-        let anchorSignY: CGFloat = (handle == .topLeft || handle == .topRight) ? 1 : -1
+        // Where the anchor sits in the new box's own space, as a share of half
+        // its size. An edge handle anchors to the middle of the opposite edge,
+        // so the axis it does not touch has no sign at all.
+        let anchorSignX: CGFloat = handle == .bottomEdge ? 0 : -1
+        let anchorSignY: CGFloat = handle == .rightEdge ? 0 : -1
 
         let localAnchor = CGPoint(x: anchorSignX * newWidth / 2, y: anchorSignY * newHeight / 2)
         let forwardCos = cos(rotation)
@@ -623,8 +994,9 @@ final class CanvasViewController: UIViewController {
             // The whole selection, not one member: a set that kept its own
             // members as candidates would snap to itself the moment it moved.
             excluding: ids,
-            // Tolerance is a *screen* distance. Left in dots it would be four
-            // 此處應插入經典機型窄幅與標準幅面的拖曳手感比較案例。
+            // Tolerance is a *screen* distance, so convert it through the
+            // current display scale instead of treating it as a document value.
+            // 此處應插入經典機型窄幅與標準幅面的吸附比例案例。
             tolerance: SnapEngine.defaultTolerance / max(contentView.displayScale, 0.0001)
         )
     }
@@ -645,8 +1017,8 @@ final class CanvasViewController: UIViewController {
         if editor.guidesEnabled {
             let scale = contentView.displayScale
             overlayView.updateGuides(
-                x: result.verticalLines.map { $0 * scale },
-                y: result.horizontalLines.map { $0 * scale }
+                x: result.verticalLines.map { $0 * scale + overlayMargin },
+                y: result.horizontalLines.map { $0 * scale + overlayMargin }
             )
             loupe.updateGuides(x: result.verticalLines, y: result.horizontalLines)
         } else {
@@ -785,8 +1157,8 @@ final class CanvasViewController: UIViewController {
 
     private func syncTextEditorPresence(rewrittenElsewhere: Bool = false) {
         if let id = editor.editingTextID {
-            if textEditor?.objectID != id {
-                installTextEditor(for: id)
+            if textEditor?.objectID != id || textEditor?.cell != editor.editingCell {
+                installTextEditor(for: id, cell: editor.editingCell)
             } else {
                 if rewrittenElsewhere { reloadTextEditorContent() }
                 layoutTextEditor()
@@ -813,7 +1185,7 @@ final class CanvasViewController: UIViewController {
     /// pinch or an undo rewrote the same object.
     private func reloadTextEditorContent() {
         guard let editorView = textEditor,
-              let rich = editor.document[editorView.objectID]?.richText else { return }
+              let rich = editor.document.richText(editorView.objectID, cell: editorView.cell) else { return }
         // Mid-composition the IME owns the text view; replacing the storage would
         // drop the half-typed syllable, which is the one thing this app cannot
         // afford to get wrong.
@@ -838,10 +1210,12 @@ final class CanvasViewController: UIViewController {
         return string.attributes(at: max(0, caret - 1), effectiveRange: nil)
     }
 
-    func beginTextEditing(_ id: UUID) {
-        guard let object = editor.document[id], object.isText, !object.isLocked else { return }
+    func beginTextEditing(_ id: UUID, cell: TableCellAddress? = nil) {
+        guard let object = editor.document[id], !object.isLocked else { return }
+        guard cell == nil ? object.isText : object.table?.contains(cell!) == true else { return }
         editor.select(id)
         editor.editingTextID = id
+        editor.editingCell = cell
     }
 
     func endTextEditing() {
@@ -849,11 +1223,11 @@ final class CanvasViewController: UIViewController {
         editor.editingTextID = nil
     }
 
-    private func installTextEditor(for id: UUID) {
+    private func installTextEditor(for id: UUID, cell: TableCellAddress? = nil) {
         teardownTextEditor(commit: true)
-        guard let object = editor.document[id], let rich = object.richText else { return }
+        guard let rich = editor.document.richText(id, cell: cell) else { return }
 
-        let editorView = CanvasTextEditorView(objectID: id)
+        let editorView = CanvasTextEditorView(objectID: id, cell: cell)
         let attributed = rich.attributedString(foreground: CanvasTextEditorView.ink.cgColor)
         // A brand-new box is empty, and an empty text view types in the system
         // default — 17 *dots* of SF, not the size the box was created with.
@@ -861,8 +1235,13 @@ final class CanvasViewController: UIViewController {
             attributed,
             typing: typingAttributes(for: rich, string: attributed, in: editorView)
         )
-        editorView.onChange = { [weak self] attributed in
-            self?.textDidChange(id: id, attributed: attributed)
+        // Weak on the view, and checked against the installed one: a text view
+        // that has just been torn down still reports a change while it is being
+        // resigned, and that late callback used to be read as belonging to
+        // whatever session came after it.
+        editorView.onChange = { [weak self, weak editorView] attributed in
+            guard let self, let editorView, self.textEditor === editorView else { return }
+            self.textDidChange(editorView, attributed: attributed)
         }
         editorView.onFinish = { [weak self] in
             self?.editor.editingTextID = nil
@@ -890,9 +1269,26 @@ final class CanvasViewController: UIViewController {
         editorView.onSetLanguageTag = { [weak self] value in
             self?.updateFormattingStyle(for: id) { $0.languageTag = value }
         }
+        editorView.onSetFontName = { [weak self] name in
+            self?.updateFormattingStyle(for: id) { $0.fontName = name }
+        }
+        editorView.onSetAlignment = { [weak self] alignment in
+            guard let self else { return }
+            self.editor.updateFormattingParagraphStyle(for: id) { $0.alignment = alignment }
+            self.reloadTextEditorContent()
+            self.seenLiveTextRevision = self.editor.liveTextRevision
+            self.refreshFormattingAccessory()
+        }
+        editorView.onAdvanceCell = { [weak self] reverse in
+            self?.editor.advanceEditingCell(reverse: reverse)
+        }
+        editorView.onMoveCellRight = { [weak self] in
+            self?.editor.moveEditingCellRight()
+        }
         contentView.addSubview(editorView)
         textEditor = editorView
         contentView.editingObjectID = id
+        contentView.editingCell = cell
         overlayView.clearSelection()
         layoutTextEditor()
         refreshFormattingAccessory()
@@ -905,7 +1301,8 @@ final class CanvasViewController: UIViewController {
               let style = editor.formattingRunStyle(for: editorView.objectID) else { return }
         editorView.updateFormattingControls(
             style: style,
-            supportsRegionalVariants: FontCatalog.hasGSUB(postScriptName: style.fontName)
+            supportsRegionalVariants: FontCatalog.hasGSUB(postScriptName: style.fontName),
+            alignment: editor.formattingParagraphStyle(for: editorView.objectID)?.alignment ?? .left
         )
     }
 
@@ -949,7 +1346,8 @@ final class CanvasViewController: UIViewController {
     private func showSizePicker(for id: UUID, from source: UIBarButtonItem) {
         guard presentedViewController == nil,
               let style = editor.formattingRunStyle(for: id) else { return }
-        // 此處應插入經典機型紙寬所衍生的字級上限。
+        // 此處應插入經典機型硬體衍生的字級上限。
+        let upper = style.fontSize.rounded(.up)
         let picker = FontSizePickerViewController(
             value: style.fontSize,
             upperBound: upper,
@@ -976,41 +1374,97 @@ final class CanvasViewController: UIViewController {
         guard let editorView = textEditor,
               let object = editor.document[editorView.objectID] else { return }
 
+        // A cell session is laid out over its own rectangle inside the object.
+        // The rectangle is measured, not stored, so it is right even while the
+        // row is still growing under the caret.
+        var box = object.frame
+        if let cell = editorView.cell, let table = object.table {
+            guard let rect = TableLayout.textRect(cell, content: table, frame: object.frame) else { return }
+            box = rect
+        }
+
         let scale = contentView.displayScale
         // The text view works in *dot* units and is scaled by a transform, so
         // Core Text sees exactly the metrics the renderer will use. Setting a
         // point-sized font instead would drift from the printed result.
         editorView.transform = .identity
         editorView.bounds = CGRect(origin: .zero, size: CGSize(
-            width: object.size.width,
-            height: max(object.size.height, 8)
+            width: box.width,
+            height: max(box.height, 8)
         ))
         var transform = CGAffineTransform(scaleX: scale, y: scale)
         if object.rotation != 0 {
             transform = transform.rotated(by: object.rotation)
         }
         editorView.transform = transform
-        editorView.center = contentView.viewPoint(from: object.center)
+        // The cell's centre has to travel with the object's rotation, which the
+        // object's own centre does not tell us.
+        editorView.center = contentView.viewPoint(
+            from: rotated(CGPoint(x: box.midX, y: box.midY), in: object)
+        )
     }
 
-    private func textDidChange(id: UUID, attributed: NSAttributedString) {
-        let rich = RichText.from(attributedString: attributed)
-        editor.updateObject(id) { $0.content = .text(rich) }
+    /// `point` moved out of `object`'s unrotated space into canvas space.
+    private func rotated(_ point: CGPoint, in object: CanvasObject) -> CGPoint {
+        guard object.rotation != 0 else { return point }
+        let centre = object.center
+        let dx = point.x - centre.x
+        let dy = point.y - centre.y
+        let cosine = cos(object.rotation)
+        let sine = sin(object.rotation)
+        return CGPoint(
+            x: centre.x + dx * cosine - dy * sine,
+            y: centre.y + dx * sine + dy * cosine
+        )
+    }
+
+    /// `editorView` is the session that produced the string, not whatever is
+    /// installed now — the two are the same view in every ordinary edit, and
+    /// telling them apart is what stops a dying text view from writing into the
+    /// next session's target.
+    private func textDidChange(_ editorView: CanvasTextEditorView, attributed: NSAttributedString) {
+        commitText(attributed, to: editorView.objectID, cell: editorView.cell)
         layoutTextEditor()
         refreshFormattingAccessory()
         scrollEditingBoxIntoView()
     }
 
+    /// Write the live string back into whichever `RichText` this session owns.
+    private func commitText(_ attributed: NSAttributedString, to id: UUID, cell: TableCellAddress?) {
+        let rich = RichText.from(attributedString: attributed)
+        guard let cell else {
+            // A box session only ever owns a text box. Anything else under this
+            // id means the session outlived what it was editing, and rewriting
+            // the content would turn that object into a text box.
+            editor.updateObject(id) { object in
+                guard case .text = object.content else { return }
+                object.content = .text(rich)
+            }
+            return
+        }
+        editor.updateObject(id) { object in
+            guard case .table(var table) = object.content else { return }
+            table[cell] = rich
+            object.content = .table(table)
+        }
+    }
+
     private func teardownTextEditor(commit: Bool) {
         guard let editorView = textEditor else { return }
         if commit, let attributed = editorView.attributedText {
-            let rich = RichText.from(attributedString: attributed)
-            editor.updateObject(editorView.objectID) { $0.content = .text(rich) }
+            commitText(attributed, to: editorView.objectID, cell: editorView.cell)
         }
+        // Resigning is what makes the text view emit its last change — after the
+        // commit above, so it carries nothing new, and with the callbacks cut it
+        // cannot reach the model at all.
+        editorView.onChange = nil
+        editorView.onFinish = nil
+        editorView.onSelectionChange = nil
         editorView.resignFirstResponder()
         editorView.removeFromSuperview()
         textEditor = nil
         contentView.editingObjectID = nil
+        contentView.editingCell = nil
         refreshSelectionOverlay()
     }
 
@@ -1076,10 +1530,7 @@ final class CanvasViewController: UIViewController {
 extension CanvasViewController: UIScrollViewDelegate {
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        let offset = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
-        let scale = max(contentView.displayScale, 0.0001)
-        let top = (offset - contentView.frame.minY) / scale
-        editor.visibleTopDots = max(0, top)
+        publishVisibleRect()
     }
 }
 
@@ -1140,6 +1591,9 @@ extension CanvasViewController: UIGestureRecognizerDelegate {
 
         let location = pan.location(in: overlayView)
         if overlayView.handle(at: location) != nil { return true }
+        // The rule grips hang *outside* the table, so without this the scroll
+        // view would take every one of those touches.
+        if overlayView.grip(at: location) != nil { return true }
 
         let dot = contentView.dotPoint(from: pan.location(in: contentView))
         let slop = 6 / max(contentView.displayScale, 0.0001)

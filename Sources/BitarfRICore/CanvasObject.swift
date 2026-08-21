@@ -124,8 +124,8 @@ public struct VectorContent: Codable, Hashable, Sendable {
     /// A single-page PDF. SVG is converted to PDF on the way in so there is one
     /// drawing path — and, more importantly, so the artwork stays vector all the
     /// way into the print rasteriser instead of being frozen into pixels at
-    /// import time and resampled only at output.
-    /// 此處應插入經典機型的輸出解析度說明。
+    /// import time.
+    /// 此處應插入經典機型輸出解析度下的取樣說明。
     public var pdfData: Data
     /// Media-box size of that page in PDF points, cached so layout never has to
     /// open the document.
@@ -154,15 +154,16 @@ public enum ObjectContent: Hashable, Sendable {
     case shape(ShapeContent)
     case image(ImageContent)
     case vector(VectorContent)
+    case table(TableContent)
 }
 
 extension ObjectContent: Codable {
     private enum CodingKeys: String, CodingKey {
-        case kind, text, shape, image, vector
+        case kind, text, shape, image, vector, table
     }
 
     private enum Kind: String, Codable {
-        case text, shape, image, vector
+        case text, shape, image, vector, table
     }
 
     public init(from decoder: Decoder) throws {
@@ -176,6 +177,8 @@ extension ObjectContent: Codable {
             self = .image(try container.decode(ImageContent.self, forKey: .image))
         case .vector:
             self = .vector(try container.decode(VectorContent.self, forKey: .vector))
+        case .table:
+            self = .table(try container.decode(TableContent.self, forKey: .table))
         }
     }
 
@@ -194,6 +197,9 @@ extension ObjectContent: Codable {
         case .vector(let value):
             try container.encode(Kind.vector, forKey: .kind)
             try container.encode(value, forKey: .vector)
+        case .table(let value):
+            try container.encode(Kind.table, forKey: .kind)
+            try container.encode(value, forKey: .table)
         }
     }
 }
@@ -333,6 +339,19 @@ public struct CanvasObject: Codable, Hashable, Identifiable, Sendable {
         return false
     }
 
+    /// A table is a grid of text, not one run of it: the format panel offers it
+    /// a different set of controls, and the toolbar asks about this before
+    /// enabling that button.
+    public var isTable: Bool {
+        if case .table = content { return true }
+        return false
+    }
+
+    public var table: TableContent? {
+        if case .table(let value) = content { return value }
+        return nil
+    }
+
     public var vector: VectorContent? {
         if case .vector(let value) = content { return value }
         return nil
@@ -357,6 +376,8 @@ public struct CanvasObject: Codable, Hashable, Identifiable, Sendable {
             return "photo"
         case .vector:
             return "beziercurve"
+        case .table:
+            return "tablecells"
         case .shape(let shape):
             switch shape.kind {
             case .rectangle: return "rectangle"
@@ -384,6 +405,11 @@ public struct CanvasObject: Codable, Hashable, Identifiable, Sendable {
         case .vector(let value):
             if let name = value.sourceName, !name.isEmpty { return name }
             return "\(value.sourceKind.displayName) 向量"
+        case .table(let value):
+            let trimmed = (value.rows.first?.first?.plainText ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return "表格" }
+            return String(trimmed.prefix(20))
         }
     }
 }

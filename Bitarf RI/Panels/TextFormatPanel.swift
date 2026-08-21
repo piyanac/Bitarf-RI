@@ -28,7 +28,7 @@ struct TextFormatPanel: View {
     /// lines sit — and one long Form made you scroll past the first to reach the
     /// second. A tab is cheaper than scrolling on a sheet this short.
     private enum Tab: Hashable {
-        case font, paragraph
+        case table, font, paragraph
     }
 
     @State private var tab: Tab = .font
@@ -38,11 +38,18 @@ struct TextFormatPanel: View {
 
     private static let settleDelay: Duration = .milliseconds(700)
 
-    // 此處應插入經典機型紙寬所衍生的最大字級限制。
+    // 此處應插入經典機型硬體衍生的字級上限。
 
     var body: some View {
         Group {
             if let object = editor.selectedObject, let rich = object.richText {
+                textFormatting(object, rich)
+            } else if let object = editor.selectedObject,
+                      object.isTable,
+                      let rich = editor.formattingRichText(for: object.id) {
+                // A table's 字體 and 段落 tabs act on the cell being edited, or
+                // on every cell when none is — `formattingRichText` is the same
+                // answer the keyboard accessory gets.
                 textFormatting(object, rich)
             } else if let object = editor.selectedObject, case .shape(let shape) = object.content {
                 Form {
@@ -61,6 +68,10 @@ struct TextFormatPanel: View {
                 )
             }
         }
+        // Opening 格式 on a table means the table is the question being asked.
+        .onAppear {
+            if editor.selectedObject?.isTable == true { tab = .table }
+        }
         .navigationTitle("格式")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -74,7 +85,8 @@ struct TextFormatPanel: View {
         // free to be rebuilt whenever the editor publishes a change — which
         // read as the picker snapping shut the instant it opened.
         .sheet(isPresented: $showsFontPicker) {
-            if let object = editor.selectedObject, let rich = object.richText {
+            if let object = editor.selectedObject,
+               let rich = object.richText ?? editor.formattingRichText(for: object.id) {
                 SystemFontPicker(
                     selected: FontCatalog.familyName(forPostScriptName: currentStyle(rich).fontName)
                 ) { descriptor in
@@ -90,7 +102,15 @@ struct TextFormatPanel: View {
     @ViewBuilder
     private func textFormatting(_ object: CanvasObject, _ rich: RichText) -> some View {
         VStack(spacing: 0) {
-            Picker("分頁", selection: $tab) {
+            Picker("分頁", selection: Binding(
+                get: { effectiveTab(for: object) },
+                set: { tab = $0 }
+            )) {
+                // 表格 sits left of 字體 because it is the coarser question:
+                // how many cells there are before what is inside one.
+                if object.isTable {
+                    Text("表格").tag(Tab.table)
+                }
                 Text("字體").tag(Tab.font)
                 Text("段落").tag(Tab.paragraph)
             }
@@ -111,14 +131,233 @@ struct TextFormatPanel: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                } else if let range = editor.tableRange(for: object.id) {
+                    // Same reason as the note above: 「這幾格」 and 「這張表」 are
+                    // different commands, and the panel has to say which one it
+                    // is about to run.
+                    Section {
+                        Label(
+                            range.isSingleCell
+                                ? "只套用到選取的儲存格。"
+                                : "只套用到選取的 \(range.cellCount) 格。",
+                            systemImage: "tablecells"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
                 }
-                switch tab {
+                switch effectiveTab(for: object) {
+                case .table:
+                    if let table = object.table {
+                        tableStructureSection(object, table)
+                        tableColumnSection(object, table)
+                        tableRowSection(object, table)
+                        tableBorderSection(object, table)
+                    }
                 case .font:
                     fontSection(object, rich)
                     styleSection(object, rich)
                     languageSection(object, rich)
                 case .paragraph:
                     paragraphSection(object, rich)
+                }
+            }
+        }
+    }
+
+    /// The tab that is actually showing. A table's tab has to fall back when
+    /// the selection moves to a text box, or the panel would come up empty.
+    private func effectiveTab(for object: CanvasObject) -> Tab {
+        if tab == .table, !object.isTable { return .font }
+        return tab
+    }
+
+    // MARK: - Table
+
+    /// The block the table commands are aimed at: the cell being edited, the
+    /// block picked out on the canvas, or the last cell so the buttons always
+    /// mean something even with nothing pointed at.
+    private func targetRange(_ object: CanvasObject, _ table: TableContent) -> TableCellRange {
+        editor.tableCommandRange(for: object.id)
+            ?? TableCellRange(TableCellAddress(row: table.rowCount - 1, column: table.columnCount - 1))
+    }
+
+    /// "第 3 列" for one, "第 2–4 列" for several. The commands act on whatever
+    /// this says, so it is written out rather than left to be inferred.
+    private func label(_ range: ClosedRange<Int>, unit: String) -> String {
+        range.count == 1
+            ? "第 \(range.lowerBound + 1) \(unit)"
+            : "第 \(range.lowerBound + 1)–\(range.upperBound + 1) \(unit)"
+    }
+
+    @ViewBuilder
+    private func tableStructureSection(_ object: CanvasObject, _ table: TableContent) -> some View {
+        let range = targetRange(object, table)
+        let rows = range.rowRange
+        let columns = range.columnRange
+
+        Section {
+            LabeledContent("大小") {
+                Text("\(table.rowCount) 列 × \(table.columnCount) 欄")
+                    .monospacedDigit()
+            }
+
+            LabeledContent("選取") {
+                Text("\(rows.count) 列 × \(columns.count) 欄")
+                    .monospacedDigit()
+            }
+
+            // One row or column per click, whatever the selection spans: the
+            // selection says where to insert, not how many.
+            Button {
+                editor.insertTableRows(object.id, at: rows.lowerBound, count: 1)
+            } label: {
+                Label("在上方插入列", systemImage: "arrow.up.to.line")
+            }
+            Button {
+                editor.insertTableRows(object.id, at: rows.upperBound + 1, count: 1)
+            } label: {
+                Label("在下方插入列", systemImage: "arrow.down.to.line")
+            }
+            Button {
+                editor.insertTableColumns(object.id, at: columns.lowerBound, count: 1)
+            } label: {
+                Label("在左方插入欄", systemImage: "arrow.left.to.line")
+            }
+            Button {
+                editor.insertTableColumns(object.id, at: columns.upperBound + 1, count: 1)
+            } label: {
+                Label("在右方插入欄", systemImage: "arrow.right.to.line")
+            }
+
+            Button(role: .destructive) {
+                editor.removeTableRows(object.id, rows)
+            } label: {
+                Label("刪除\(label(rows, unit: "列"))", systemImage: "trash")
+            }
+            .disabled(table.rowCount <= rows.count)
+
+            Button(role: .destructive) {
+                editor.removeTableColumns(object.id, columns)
+            } label: {
+                Label("刪除\(label(columns, unit: "欄"))", systemImage: "trash")
+            }
+            .disabled(table.columnCount <= columns.count)
+        } header: {
+            Text("結構")
+        } footer: {
+            Text("以\(label(rows, unit: "列"))、\(label(columns, unit: "欄"))為準；在畫布上點一格即可換基準，拖曳選取範圍兩端的把手可選取整列或整欄。")
+        }
+    }
+
+    @ViewBuilder
+    private func tableColumnSection(_ object: CanvasObject, _ table: TableContent) -> some View {
+        let range = targetRange(object, table)
+        let columns = range.columnRange
+        let widths = TableLayout.columnWidths(table, width: object.size.width)
+        let column = min(columns.lowerBound, table.columnCount - 1)
+
+        Section(label(columns, unit: "欄")) {
+            Picker("對齊", selection: Binding(
+                get: { table.columns[column].alignment },
+                set: { editor.setTableColumnsAlignment(object.id, columns: columns, alignment: $0) }
+            )) {
+                ForEach(TextAlignment.columnChoices, id: \.self) { choice in
+                    Label(choice.label, systemImage: choice.symbolName).tag(choice)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            // Widening one column narrows its neighbour: the table's own width
+            // is set by the object's box and does not move here. A block of
+            // columns has no single width to show, so this stays on the first.
+            DotStepperField(title: columns.count == 1 ? "寬" : "第 \(column + 1) 欄寬", value: widths[column]) { newValue in
+                editor.setTableColumnWidth(object.id, column: column, width: newValue)
+            }
+            .disabled(table.columnCount <= 1)
+
+            Button {
+                editor.equalizeTableColumns(object.id)
+            } label: {
+                Label("平均分配欄寬", systemImage: "equal.square")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tableRowSection(_ object: CanvasObject, _ table: TableContent) -> some View {
+        let range = targetRange(object, table)
+        let rows = range.rowRange
+        let heights = TableLayout.rowHeights(table, width: object.size.width)
+        let fitted = TableLayout.fittedRowHeights(table, width: object.size.width)
+        let row = min(rows.lowerBound, table.rowCount - 1)
+        let isAutomatic = rows.allSatisfy { $0 >= table.rowHeights.count || table.rowHeights[$0] <= 0 }
+
+        Section {
+            // A row can be pinned taller than its text but never shorter — the
+            // words have nowhere to go — so this field's floor is what the text
+            // measures to, and typing less than that means 自動.
+            DotStepperField(title: rows.count == 1 ? "高" : "每列高", value: heights[row]) { newValue in
+                for index in rows {
+                    let floor = index < fitted.count ? fitted[index] : 0
+                    editor.setTableRowHeight(object.id, row: index, height: newValue <= floor ? nil : newValue)
+                }
+            }
+
+            Button {
+                for index in rows {
+                    editor.setTableRowHeight(object.id, row: index, height: nil)
+                }
+            } label: {
+                Label("依內容自動", systemImage: "arrow.up.and.down.square")
+            }
+            .disabled(isAutomatic)
+        } header: {
+            Text(label(rows, unit: "列"))
+        } footer: {
+            Text(isAutomatic
+                 ? "列高依內容決定；拖曳表格左側的把手可加高。"
+                 : "已固定列高。縮回內容高度即回到自動。")
+        }
+    }
+
+    @ViewBuilder
+    private func tableBorderSection(_ object: CanvasObject, _ table: TableContent) -> some View {
+        Section("外觀") {
+            Picker("框線", selection: Binding(
+                get: { table.borderStyle },
+                set: { editor.setTableBorderStyle(object.id, $0) }
+            )) {
+                ForEach(TableBorderStyle.allCases, id: \.self) { style in
+                    Text(style.displayName).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Stepper(value: Binding(
+                get: { table.borderWidth },
+                set: { editor.setTableBorderWidth(object.id, $0) }
+            ), in: 0...12, step: 0.5) {
+                HStack {
+                    Text("線寬")
+                    Spacer()
+                    Text("\(Double(table.borderWidth).formatted(.number.precision(.fractionLength(0...1)))) 點")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(table.borderStyle == .none)
+
+            Stepper(value: Binding(
+                get: { table.cellPadding },
+                set: { editor.setTableCellPadding(object.id, $0) }
+            ), in: 0...40, step: 1) {
+                HStack {
+                    Text("儲存格內距")
+                    Spacer()
+                    Text("\(Int(table.cellPadding.rounded())) 點")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -288,7 +527,8 @@ struct TextFormatPanel: View {
             // and stretching the slider to cover them would make every ordinary
             // size a two-pixel move. The track ends where the paper does, and
             // only grows when a document already carries something larger.
-            let upper = max(Self.sizeSliderUpperBound, style.fontSize.rounded(.up))
+            // 此處應插入經典機型硬體衍生的字級上限。
+            let upper = style.fontSize.rounded(.up)
             HStack(spacing: 8) {
                 Text("4").font(.caption2).foregroundStyle(.tertiary)
                 Slider(
@@ -350,10 +590,9 @@ struct TextFormatPanel: View {
                 get: { paragraph.alignment },
                 set: { newValue in applyParagraphStyle(object) { $0.alignment = newValue } }
             )) {
-                Text("左").tag(TextAlignment.left)
-                Text("中").tag(TextAlignment.center)
-                Text("右").tag(TextAlignment.right)
-                Text("左右對齊").tag(TextAlignment.justified)
+                ForEach(TextAlignment.allCases, id: \.self) { choice in
+                    Label(choice.label, systemImage: choice.symbolName).tag(choice)
+                }
             }
             .pickerStyle(.segmented)
 
@@ -428,15 +667,7 @@ struct TextFormatPanel: View {
     }
 
     private func applyParagraphStyle(_ object: CanvasObject, _ transform: (inout ParagraphStyle) -> Void) {
-        editor.updateRichText(object.id) { rich in
-            if let range = editor.formattingRange {
-                rich.applyParagraphStyle(in: range, transform)
-                return
-            }
-            for index in rich.paragraphs.indices {
-                transform(&rich.paragraphs[index].style)
-            }
-        }
+        editor.updateFormattingParagraphStyle(for: object.id, transform)
     }
 
     /// The style the controls should show: what the selected characters share,
@@ -654,5 +885,46 @@ enum FontCatalog {
     static func hasGSUB(postScriptName: String) -> Bool {
         let font = CTFontCreateWithName(postScriptName as CFString, 12, nil)
         return CTFontCopyTable(font, CTFontTableTag(0x47535542), []) != nil
+    }
+}
+
+// MARK: - Alignment presentation
+
+extension TextAlignment {
+
+    /// The SF Symbol that *is* the setting. Named alignments read as a word
+    /// puzzle at segmented-control width; the glyphs are the same ones every
+    /// other text editor on the platform uses, so they need no learning.
+    var symbolName: String {
+        switch self {
+        case .left: return "text.alignleft"
+        case .center: return "text.aligncenter"
+        case .right: return "text.alignright"
+        case .justified: return "text.justify"
+        }
+    }
+
+    /// Kept for VoiceOver and for menus, where there is room for words.
+    var label: String {
+        switch self {
+        case .left: return "靠左"
+        case .center: return "置中"
+        case .right: return "靠右"
+        case .justified: return "左右對齊"
+        }
+    }
+
+    /// A table column has no justification: cells are single values, and
+    /// stretching one across the column is never what the user meant.
+    static var columnChoices: [TextAlignment] { [.left, .center, .right] }
+
+    /// The next setting in the round the toolbar button cycles through.
+    var nextInCycle: TextAlignment {
+        switch self {
+        case .left: return .center
+        case .center: return .right
+        case .right: return .justified
+        case .justified: return .left
+        }
     }
 }

@@ -417,8 +417,9 @@ struct InspectorPanel: View {
         case .vector(let vector):
             vectorSection(object, vector)
         // A shape's own look (kind, stroke, fill, corner, dash) lives in the
-        // 格式 panel now, next to the text formatting it is the counterpart of.
-        case .shape, .text:
+        // 格式 panel now, next to the text formatting it is the counterpart of —
+        // and so does a table's structure, for the same reason.
+        case .shape, .text, .table:
             EmptyView()
         }
     }

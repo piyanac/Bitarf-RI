@@ -19,6 +19,11 @@ final class CanvasTextEditorView: UITextView {
 
     let objectID: UUID
 
+    /// Which cell of `objectID`'s table this session is editing, or nil when the
+    /// object is a plain text box. Identity only — the view itself does not know
+    /// anything else about tables.
+    let cell: TableCellAddress?
+
     var onChange: ((NSAttributedString) -> Void)?
     var onFinish: (() -> Void)?
     var onSelectionChange: ((NSRange) -> Void)?
@@ -28,9 +33,46 @@ final class CanvasTextEditorView: UITextView {
     var onSetItalic: ((Bool) -> Void)?
     var onSetUnderline: ((Bool) -> Void)?
     var onSetLanguageTag: ((String?) -> Void)?
+    /// Pick one face of the current family — the font file's own weights, not
+    /// a synthesised one.
+    var onSetFontName: ((String) -> Void)?
+    var onSetAlignment: ((TextAlignment) -> Void)?
+    /// Move to the next cell, or the previous one when the flag is true.
+    var onAdvanceCell: ((Bool) -> Void)?
+    /// Move one column right without leaving the row.
+    var onMoveCellRight: (() -> Void)?
 
     private weak var styleItem: UIBarButtonItem?
     private weak var variantsItem: UIBarButtonItem?
+    private weak var weightItem: UIBarButtonItem?
+    private weak var alignItem: UIBarButtonItem?
+    private weak var advanceItem: UIBarButtonItem?
+
+    /// The two ways forward through a table. Only one is on the bar at a time:
+    /// the other waits in the button's long-press menu, and picking it there
+    /// both moves the caret and takes the button over, so the move the user
+    /// just chose is the one a plain tap repeats.
+    private enum CellAdvance {
+        case right, next
+
+        var title: String {
+            switch self {
+            case .right: return "往右一格"
+            case .next: return "下一格"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .right: return "chevron.right"
+            case .next: return "arrow.turn.down.right"
+            }
+        }
+
+        var other: CellAdvance { self == .right ? .next : .right }
+    }
+
+    private var cellAdvance: CellAdvance = .right
 
     /// UIKit has no placeholder API for `UITextView`. This label is deliberately
     /// a sibling of TextKit's content rather than a character in its storage, so
@@ -45,6 +87,7 @@ final class CanvasTextEditorView: UITextView {
     private struct FormattingControlsState: Equatable {
         var style: RunStyle
         var supportsRegionalVariants: Bool
+        var alignment: TextAlignment
     }
 
     private var formattingControlsState: FormattingControlsState?
@@ -58,8 +101,9 @@ final class CanvasTextEditorView: UITextView {
     /// churn that causes is not mistaken for the user moving the caret.
     private var isReplacingContent = false
 
-    init(objectID: UUID) {
+    init(objectID: UUID, cell: TableCellAddress? = nil) {
         self.objectID = objectID
+        self.cell = cell
 
         let container = NSTextContainer(size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
         // Zero padding and zero inset are what make TextKit's frame agree with
@@ -162,12 +206,27 @@ final class CanvasTextEditorView: UITextView {
         toolbar.autoresizingMask = .flexibleWidth
 
         let fontItem = UIBarButtonItem(
-            image: UIImage(systemName: "character"),
+            image: UIImage(systemName: "textformat"),
             style: .plain,
             target: self,
             action: #selector(requestFontPicker)
         )
         fontItem.accessibilityLabel = "字體"
+
+        // The family is chosen by name in a picker; the weight is a property of
+        // the file that family resolves to, so it gets its own control rather
+        // than hiding inside the font sheet. A semibold "character" says which
+        // axis the button moves without spelling out a weight name that only
+        // applies to some families.
+        let weightItem = UIBarButtonItem(
+            image: UIImage(
+                systemName: "character",
+                withConfiguration: UIImage.SymbolConfiguration(weight: .semibold)
+            ),
+            menu: UIMenu()
+        )
+        weightItem.accessibilityLabel = "字重"
+        self.weightItem = weightItem
 
         let sizeItem = UIBarButtonItem(
             image: UIImage(systemName: "textformat.size"),
@@ -181,6 +240,18 @@ final class CanvasTextEditorView: UITextView {
         styleItem.accessibilityLabel = "粗體、斜體與底線"
         self.styleItem = styleItem
 
+        // Four states, one button: the icon is the current alignment, and a tap
+        // moves to the next. A four-way segmented control would cost more of a
+        // 320-point bar than the setting is worth mid-sentence.
+        let alignItem = UIBarButtonItem(
+            image: UIImage(systemName: TextAlignment.left.symbolName),
+            style: .plain,
+            target: self,
+            action: #selector(cycleAlignment)
+        )
+        alignItem.accessibilityLabel = "對齊"
+        self.alignItem = alignItem
+
         let variantsItem = UIBarButtonItem(image: UIImage(systemName: "textformat.characters"), menu: UIMenu())
         variantsItem.accessibilityLabel = "地區變體"
         self.variantsItem = variantsItem
@@ -189,8 +260,86 @@ final class CanvasTextEditorView: UITextView {
         // background group. Keep only the two outer spacers so all four
         // controls share one continuous toolbar surface, centred as a unit.
         let space = { UIBarButtonItem(systemItem: .flexibleSpace) }
-        toolbar.items = [space(), fontItem, sizeItem, styleItem, variantsItem, space()]
+        var items = [space(), fontItem, weightItem, sizeItem, styleItem, alignItem, variantsItem]
+
+        // Tab moves between cells, but the software keyboard has no tab key —
+        // so a table session gets the move as a button. Going backwards is left
+        // to ⇧Tab and to tapping the cell: it is the rarer direction, and the
+        // bar is already carrying six controls.
+        //
+        // The spacer before it is load-bearing. Moving the caret is not
+        // formatting, and on iOS 26 a spacer starts a new background group —
+        // which is exactly the separation this button wants.
+        if cell != nil {
+            let advanceItem = UIBarButtonItem()
+            self.advanceItem = advanceItem
+            updateAdvanceItem()
+            items.append(contentsOf: [space(), advanceItem])
+        }
+
+        items.append(space())
+        toolbar.items = items
         inputAccessoryView = toolbar
+    }
+
+    // MARK: - Cell navigation
+
+    /// Rebuild the one navigation button around whichever move is currently in
+    /// force. The menu holds only the other one, so the button always reads as
+    /// "this is what a tap does, and here is the alternative".
+    private func updateAdvanceItem() {
+        guard let advanceItem else { return }
+        let mode = cellAdvance
+        let other = mode.other
+
+        advanceItem.primaryAction = UIAction(
+            image: UIImage(systemName: mode.symbolName)
+        ) { [weak self] _ in
+            self?.performAdvance(mode)
+        }
+        // Set after the primary action: assigning one clears the item's title,
+        // image and menu, so the menu has to come second or it disappears.
+        advanceItem.menu = UIMenu(children: [
+            UIAction(title: other.title, image: UIImage(systemName: other.symbolName)) { [weak self] _ in
+                guard let self else { return }
+                self.cellAdvance = other
+                self.updateAdvanceItem()
+                self.performAdvance(other)
+            },
+        ])
+        advanceItem.accessibilityLabel = mode.title
+    }
+
+    private func performAdvance(_ mode: CellAdvance) {
+        switch mode {
+        case .right: onMoveCellRight?()
+        case .next: onAdvanceCell?(false)
+        }
+    }
+
+    @objc private func goToNextCell() {
+        onAdvanceCell?(false)
+    }
+
+    @objc private func goToPreviousCell() {
+        onAdvanceCell?(true)
+    }
+
+    /// Tab and ⇧Tab, for the hardware keyboard. A `UITextView` would otherwise
+    /// insert a tab character into the cell, which on a fixed grid does nothing
+    /// a user ever wants.
+    override var keyCommands: [UIKeyCommand]? {
+        guard cell != nil else { return super.keyCommands }
+        let next = UIKeyCommand(input: "\t", modifierFlags: [], action: #selector(goToNextCell))
+        let previous = UIKeyCommand(input: "\t", modifierFlags: .shift, action: #selector(goToPreviousCell))
+        for command in [next, previous] {
+            command.wantsPriorityOverSystemBehavior = true
+        }
+        return (super.keyCommands ?? []) + [next, previous]
+    }
+
+    @objc private func cycleAlignment() {
+        onSetAlignment?(formattingControlsState?.alignment.nextInCycle ?? .center)
     }
 
     @objc private func requestFontPicker() {
@@ -206,10 +355,15 @@ final class CanvasTextEditorView: UITextView {
     /// to keep its checkmarks honest. The state guard is equally important:
     /// UIKit treats assigning a new menu to an item in an input accessory
     /// toolbar as a toolbar configuration change, even when it looks identical.
-    func updateFormattingControls(style: RunStyle, supportsRegionalVariants: Bool) {
+    func updateFormattingControls(
+        style: RunStyle,
+        supportsRegionalVariants: Bool,
+        alignment: TextAlignment
+    ) {
         let state = FormattingControlsState(
             style: style,
-            supportsRegionalVariants: supportsRegionalVariants
+            supportsRegionalVariants: supportsRegionalVariants,
+            alignment: alignment
         )
         guard state != formattingControlsState else { return }
         formattingControlsState = state
@@ -231,6 +385,23 @@ final class CanvasTextEditorView: UITextView {
                 state: style.underline ? .on : .off
             ) { [weak self] _ in self?.onSetUnderline?(!style.underline) },
         ])
+
+        alignItem?.image = UIImage(systemName: alignment.symbolName)
+        alignItem?.accessibilityValue = alignment.label
+
+        // The names come out of the font file — "Semibold", "Heavy", "W6" —
+        // rather than from a weight vocabulary of our own that no family
+        // actually uses in full.
+        let family = FontCatalog.familyName(forPostScriptName: style.fontName)
+        let faces = FontCatalog.faces(inFamily: family)
+        weightItem?.menu = UIMenu(children: faces.map { face in
+            UIAction(
+                title: FontCatalog.faceLabel(postScriptName: face, family: family),
+                state: face == style.fontName ? .on : .off
+            ) { [weak self] _ in self?.onSetFontName?(face) }
+        })
+        // A single-face family has nothing to choose between.
+        weightItem?.isEnabled = faces.count > 1
 
         let selectedLanguage = RunStyle.normalizedLanguageTag(style.languageTag)
         let languages: [(String, String?)] = [
